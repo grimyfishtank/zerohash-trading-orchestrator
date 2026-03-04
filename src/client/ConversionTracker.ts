@@ -142,18 +142,21 @@ export class ConversionTracker {
     const funnel = this.activeFunnels.get(flow);
     if (!funnel) return;
 
+    // Capture the last meaningful step before recording FLOW_ABANDONED
+    const lastMeaningfulStep = funnel.lastStep;
+
     this.recordStep(flow, "FLOW_ABANDONED");
 
     const durationMs = Date.now() - funnel.startedAt;
 
     this.telemetry.track("CONVERSION_ABANDONED", flow, {
-      lastStep: funnel.lastStep,
+      lastStep: lastMeaningfulStep,
       durationMs,
       stepCount: funnel.steps.length,
     });
 
     try {
-      this.hooks.onFunnelAbandoned?.(flow, funnel.lastStep, durationMs);
+      this.hooks.onFunnelAbandoned?.(flow, lastMeaningfulStep, durationMs);
     } catch {
       this.logger.warn("ConversionHooks.onFunnelAbandoned threw");
     }
@@ -161,12 +164,21 @@ export class ConversionTracker {
     this.activeFunnels.delete(flow);
     this.logger.info("Conversion funnel abandoned", {
       flow,
-      lastStep: funnel.lastStep,
+      lastStep: lastMeaningfulStep,
     });
   }
 
   getActiveFunnel(flow: TradingFlowType): Readonly<ActiveFunnel> | undefined {
     return this.activeFunnels.get(flow);
+  }
+
+  getActiveFunnels(): { flow: TradingFlowType; stepCount: number; lastStep: string; durationMs: number }[] {
+    return Array.from(this.activeFunnels.values()).map((funnel) => ({
+      flow: funnel.flow,
+      stepCount: funnel.steps.length,
+      lastStep: funnel.lastStep,
+      durationMs: Date.now() - funnel.startedAt,
+    }));
   }
 
   reset(): void {

@@ -1,6 +1,7 @@
 import { ErrorCode } from "../errors/ErrorCodes";
 import { ZeroHashError } from "../errors/ZeroHashError";
 import type { TelemetryEmitter } from "../telemetry/TelemetryHooks";
+import type { CircuitBreaker } from "../utils/CircuitBreaker";
 import type { Logger } from "../utils/logger";
 import type { JWTProvider, TradingFlowType } from "./types";
 
@@ -23,15 +24,25 @@ export class JWTManager {
   constructor(
     private readonly provider: JWTProvider,
     private readonly telemetry: TelemetryEmitter,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly flowOverrides?: Partial<Record<TradingFlowType, { jwtProvider?: JWTProvider }>>,
+    private readonly circuitBreaker?: CircuitBreaker,
   ) {}
 
   async getToken(flow: TradingFlowType): Promise<string> {
     const cached = this.cache.get(flow);
 
-    if (cached && !this.isExpiringSoon(cached)) {
-      this.logger.debug("Using cached JWT", { flow });
-      return cached.token;
+    if (cached) {
+      if (this.isExpired(cached)) {
+        this.telemetry.track("JWT_EXPIRED", flow, {
+          expiredAt: cached.expiresAt,
+          expiredAgoMs: Date.now() - cached.expiresAt,
+        });
+        this.logger.info("Cached JWT is expired, refreshing", { flow });
+      } else if (!this.isExpiringSoon(cached)) {
+        this.logger.debug("Using cached JWT", { flow });
+        return cached.token;
+      }
     }
 
     return this.fetchToken(flow);
@@ -50,6 +61,13 @@ export class JWTManager {
   invalidateAll(): void {
     this.cache.clear();
     this.logger.info("All JWTs invalidated");
+  }
+
+  getCacheStatus(): { cachedFlows: TradingFlowType[]; inflightFlows: TradingFlowType[] } {
+    return {
+      cachedFlows: Array.from(this.cache.keys()),
+      inflightFlows: Array.from(this.inflightRequests.keys()),
+    };
   }
 
   private async fetchToken(flow: TradingFlowType): Promise<string> {
@@ -71,9 +89,11 @@ export class JWTManager {
   }
 
   private async doFetch(flow: TradingFlowType): Promise<string> {
-    try {
-      this.logger.info("Fetching JWT", { flow });
-      const token = await this.provider.getJWT(flow);
+    const provider = this.flowOverrides?.[flow]?.jwtProvider ?? this.provider;
+
+    const fetchFn = async (): Promise<string> => {
+      this.logger.info("Fetching JWT", { flow, usingFlowOverride: provider !== this.provider });
+      const token = await provider.getJWT(flow);
       const decoded = this.decodeExpiry(token);
 
       this.cache.set(flow, {
@@ -84,7 +104,15 @@ export class JWTManager {
 
       this.telemetry.track("JWT_REFRESHED", flow);
       return token;
+    };
+
+    try {
+      return this.circuitBreaker
+        ? await this.circuitBreaker.execute(fetchFn)
+        : await fetchFn();
     } catch (error: unknown) {
+      if (error instanceof ZeroHashError) throw error;
+
       this.telemetry.track("JWT_FAILED", flow, {
         error: error instanceof Error ? error.message : "unknown",
       });
@@ -95,6 +123,10 @@ export class JWTManager {
         { flow, originalError: error }
       );
     }
+  }
+
+  private isExpired(cached: CachedToken): boolean {
+    return Date.now() >= cached.expiresAt;
   }
 
   private isExpiringSoon(cached: CachedToken): boolean {

@@ -1,10 +1,19 @@
 export type EventHandler<T = unknown> = (payload: T) => void;
 
+export type EventBusErrorHandler = (event: string, error: unknown) => void;
+
 export class EventBus<TEventMap extends Record<string, unknown>> {
   private readonly listeners = new Map<
     keyof TEventMap,
     Set<EventHandler<never>>
   >();
+  private readonly onError: EventBusErrorHandler;
+
+  constructor(onError?: EventBusErrorHandler) {
+    this.onError = onError ?? ((event) => {
+      console.error(`[EventBus] Listener error for event "${event}"`);
+    });
+  }
 
   on<K extends keyof TEventMap>(
     event: K,
@@ -35,11 +44,9 @@ export class EventBus<TEventMap extends Record<string, unknown>> {
     for (const handler of snapshot) {
       try {
         (handler as EventHandler<TEventMap[K]>)(payload);
-      } catch {
+      } catch (error: unknown) {
         // Swallow listener errors — telemetry must never crash the host
-        console.error(
-          `[EventBus] Listener error for event "${String(event)}"`
-        );
+        this.onError(String(event), error);
       }
     }
   }

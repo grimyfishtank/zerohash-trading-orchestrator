@@ -6,6 +6,7 @@ export interface TradingEventPayload {
   flow?: TradingFlowType;
   timestamp: number;
   metadata?: Record<string, unknown>;
+  correlationId?: string;
 }
 
 export type TradingEventType =
@@ -13,6 +14,7 @@ export type TradingEventType =
   | "FLOW_CLOSED"
   | "JWT_REFRESHED"
   | "JWT_FAILED"
+  | "JWT_EXPIRED"
   | "RETRY_ATTEMPT"
   | "ERROR_THROWN"
   | "VERSION_MISMATCH"
@@ -22,7 +24,12 @@ export type TradingEventType =
   | "CONVERSION_COMPLETED"
   | "CONVERSION_ABANDONED"
   | "SLIPPAGE_DETECTED"
-  | "RATE_LIMITED";
+  | "RATE_LIMITED"
+  | "RATE_LIMIT_QUEUED"
+  | "OPERATION_TIMEOUT"
+  | "CIRCUIT_OPENED"
+  | "CIRCUIT_CLOSED"
+  | "CIRCUIT_HALF_OPEN";
 
 export interface TelemetryConfig {
   onEvent?: (payload: TradingEventPayload) => void;
@@ -37,9 +44,10 @@ export function buildEventPayload(
   event: TradingEventType,
   flow?: TradingFlowType,
   metadata?: Record<string, unknown>,
-  enrichMetadata?: () => Record<string, unknown>
+  enrichMetadata?: () => Record<string, unknown>,
+  correlationId?: string
 ): TradingEventPayload {
-  return {
+  const payload: TradingEventPayload = {
     event,
     flow,
     timestamp: Date.now(),
@@ -48,13 +56,20 @@ export function buildEventPayload(
       ...metadata,
     },
   };
+
+  if (correlationId) {
+    payload.correlationId = correlationId;
+  }
+
+  return payload;
 }
 
 export interface TelemetryEmitter {
   track(
     event: TradingEventType,
     flow?: TradingFlowType,
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
+    correlationId?: string
   ): void;
 }
 
@@ -63,12 +78,13 @@ export function createTelemetryEmitter(
   emit: (event: TradingEventType, payload: TradingEventPayload) => void
 ): TelemetryEmitter {
   return {
-    track(event, flow, metadata) {
+    track(event, flow, metadata, correlationId) {
       const payload = buildEventPayload(
         event,
         flow,
         metadata,
-        config.enrichMetadata
+        config.enrichMetadata,
+        correlationId
       );
 
       // Emit to internal bus

@@ -69,7 +69,7 @@ export class SlippageGuard {
     expectedPrice: number,
     actualPrice: number
   ): SlippageEvent | null {
-    if (expectedPrice <= 0 || actualPrice < 0) {
+    if (expectedPrice <= 0 || actualPrice <= 0) {
       this.logger.warn("Cannot evaluate slippage: invalid prices", {
         flow,
         expectedPrice,

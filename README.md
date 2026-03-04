@@ -91,29 +91,34 @@ It's the difference between a demo integration and something you can confidently
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│           ZeroHashTradingClient              │
-│  ┌──────────┐ ┌────────────┐ ┌───────────┐  │
-│  │JWTManager│ │ModalManager│ │VersionGuard│ │
-│  └────┬─────┘ └─────┬──────┘ └───────────┘  │
-│       │              │                        │
-│  ┌────┴────────┐ ┌───┴──────┐ ┌───────────┐  │
-│  │ Conversion  │ │ Slippage │ │   Rate    │  │
-│  │  Tracker    │ │  Guard   │ │  Limiter  │  │
-│  └─────────────┘ └──────────┘ └───────────┘  │
-│       │              │                        │
-│  ┌────┴──────────────┴────────────────────┐  │
-│  │         EventBus / Telemetry           │  │
-│  └────────────────────────────────────────┘  │
-│       │              │                        │
-│  ┌────┴─────┐  ┌─────┴──────┐                │
-│  │  retry   │  │   logger   │                │
-│  └──────────┘  └────────────┘                │
-└──────────────────┬──────────────────────────┘
-                   │
-            ┌──────┴──────┐
-            │  zh-web-sdk │
-            └─────────────┘
+┌──────────────────────────────────────────────────┐
+│            ZeroHashTradingClient                  │
+│  ┌──────────┐ ┌────────────┐ ┌───────────┐       │
+│  │JWTManager│ │ModalManager│ │VersionGuard│      │
+│  └────┬─────┘ └─────┬──────┘ └───────────┘       │
+│       │              │                             │
+│  ┌────┴────────┐ ┌───┴──────┐ ┌───────────┐      │
+│  │ Conversion  │ │ Slippage │ │   Rate    │      │
+│  │  Tracker    │ │  Guard   │ │  Limiter  │      │
+│  └─────────────┘ └──────────┘ └───────────┘      │
+│       │              │                             │
+│  ┌────┴──────┐ ┌─────┴───────┐ ┌──────────────┐  │
+│  │ Circuit   │ │  Timeout    │ │ Correlation  │  │
+│  │ Breaker   │ │  Guard      │ │ ID Tracking  │  │
+│  └───────────┘ └─────────────┘ └──────────────┘  │
+│       │              │                             │
+│  ┌────┴──────────────┴─────────────────────────┐  │
+│  │          EventBus / Telemetry               │  │
+│  └─────────────────────────────────────────────┘  │
+│       │              │                             │
+│  ┌────┴─────┐  ┌─────┴──────┐                     │
+│  │  retry   │  │   logger   │                     │
+│  └──────────┘  └────────────┘                     │
+└───────────────────┬──────────────────────────────┘
+                    │
+             ┌──────┴──────┐
+             │  zh-web-sdk │
+             └─────────────┘
 ```
 
 ### Folder Structure
@@ -137,7 +142,11 @@ src/
 │   └── ErrorCodes.ts              # Exhaustive error code enum
 ├── utils/
 │   ├── retry.ts                   # Configurable retry with backoff
-│   └── logger.ts                  # Leveled logger factory
+│   ├── logger.ts                  # Leveled logger factory
+│   ├── CircuitBreaker.ts          # Three-state circuit breaker
+│   ├── withTimeout.ts             # AbortController-based timeout guard
+│   └── correlationId.ts           # Unique request correlation IDs
+├── __tests__/                     # Comprehensive test suite (91 tests)
 └── index.ts                       # Barrel exports
 ```
 
@@ -228,6 +237,7 @@ const client = new ZeroHashTradingClient({
     enableConversionTracking: true,
     enableSlippageGuard: true,
     enableRateLimiting: true,
+    enableCircuitBreaker: true,
   },
 
   // Partner metadata injected into every modal
@@ -270,6 +280,16 @@ const client = new ZeroHashTradingClient({
     windowMs: 60_000,
     strategy: "reject", // "reject" | "queue"
   },
+
+  // Circuit breaker (opt-in via featureFlags.enableCircuitBreaker)
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeoutMs: 30_000,
+    halfOpenMaxAttempts: 1,
+  },
+
+  // Operation timeout (applies to openFlow/closeFlow)
+  timeoutMs: 30_000,
 
   logLevel: "info",
 });
@@ -345,11 +365,72 @@ const client = new ZeroHashTradingClient({
     maxOperations: 5,
     windowMs: 60_000,
     strategy: "reject", // or "queue" to defer excess operations
+    maxQueueSize: 10,       // max queued ops before rejecting (queue strategy)
+    queueTimeoutMs: 30_000, // per-operation queue timeout
   },
 });
 ```
 
-When `strategy` is `"reject"`, exceeding the limit throws `ZeroHashError` with code `RATE_LIMITED`. When `"queue"`, excess operations are deferred until a slot opens in the sliding window.
+When `strategy` is `"reject"`, exceeding the limit throws `ZeroHashError` with code `RATE_LIMITED`. When `"queue"`, excess operations are deferred until a slot opens in the sliding window. The queue has built-in backpressure (`maxQueueSize`) and per-operation timeouts (`queueTimeoutMs`) to prevent unbounded growth.
+
+## Circuit Breaker
+
+Protect against cascading failures from a failing JWT provider or downstream service:
+
+```typescript
+const client = new ZeroHashTradingClient({
+  // ...
+  featureFlags: { enableCircuitBreaker: true },
+  circuitBreaker: {
+    failureThreshold: 5,     // failures before opening
+    resetTimeoutMs: 30_000,  // cooldown before half-open probe
+    halfOpenMaxAttempts: 1,  // probes before re-opening on failure
+  },
+});
+```
+
+The circuit breaker wraps JWT fetches with three-state protection (CLOSED → OPEN → HALF_OPEN → CLOSED). When open, requests fail fast with `CIRCUIT_OPEN` instead of hitting a broken service. State transitions emit telemetry events (`CIRCUIT_OPENED`, `CIRCUIT_CLOSED`, `CIRCUIT_HALF_OPEN`).
+
+## Timeout Guards
+
+All flow operations are wrapped with AbortController-based timeouts (default 30 seconds):
+
+```typescript
+const client = new ZeroHashTradingClient({
+  // ...
+  timeoutMs: 15_000, // 15 second timeout for openFlow/closeFlow
+});
+```
+
+If an operation exceeds the timeout, it throws `ZeroHashError` with code `OPERATION_TIMEOUT`. The AbortSignal is checked between async steps (JWT fetch, modal open) for cooperative cancellation.
+
+## Correlation IDs
+
+Every `openFlow()` call generates a unique correlation ID (e.g. `cid_m1abc2def3gh0001`) that is threaded through all telemetry events, conversion funnel steps, and retry attempts for that operation. This enables end-to-end request tracing across your analytics pipeline.
+
+```typescript
+client.on("FLOW_OPENED", (payload) => {
+  console.log(payload.correlationId); // "cid_m1abc2..."
+});
+```
+
+## Health / Diagnostics API
+
+Inspect the full internal state of the client for monitoring and debugging:
+
+```typescript
+const status = client.health();
+// {
+//   initialized: true,
+//   activeFlow: "CRYPTO_BUY",
+//   jwt: { cachedFlows: ["CRYPTO_BUY"], inflightFlows: [] },
+//   modal: { isOpen: true, currentFlow: "CRYPTO_BUY" },
+//   rateLimiter: { "flow:CRYPTO_BUY": { remaining: 4, retryAfterMs: 0 } },
+//   circuitBreaker: { state: "CLOSED", failures: 0, lastFailure: null },
+//   conversionFunnels: [{ flow: "CRYPTO_BUY", stepCount: 3, lastStep: "MODAL_DISPLAYED", durationMs: 1234 }],
+//   uptime: 45000,
+// }
+```
 
 ## Error Model
 
@@ -393,6 +474,8 @@ try {
 | `RETRY_EXHAUSTED` | All retry attempts failed |
 | `RATE_LIMITED` | Client-side rate limit exceeded |
 | `SLIPPAGE_EXCEEDED` | Price slippage beyond configured tolerance |
+| `CIRCUIT_OPEN` | Circuit breaker is open — requests are being rejected |
+| `OPERATION_TIMEOUT` | Operation exceeded the configured timeout |
 
 ## Security Considerations
 
@@ -470,10 +553,17 @@ Type safety becomes increasingly valuable as more flows and edge cases are intro
 
 ### What makes this "production-ready"?
 
-- JWT lifecycle coordination
-- Single-modal enforcement
-- Structured error surface
-- Analytics event emission
+- JWT lifecycle coordination with preemptive refresh and per-flow providers
+- Single-modal enforcement with stale state reconciliation
+- Circuit breaker protection against cascading failures
+- Timeout guards with AbortController-based cooperative cancellation
+- Correlation ID tracing across all operations
+- Rate limiting with queue backpressure and per-operation timeouts
+- Conversion funnel analytics engine
+- Slippage protection with per-flow overrides
+- Structured error surface with typed error codes
+- Health/diagnostics API for monitoring
+- Comprehensive test suite (91 tests)
 - Version-aware safety boundaries
 - Extensible architecture for future flow expansion
 

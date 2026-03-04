@@ -1,4 +1,5 @@
 import type { TelemetryConfig } from "../telemetry/TelemetryHooks";
+import type { CircuitBreakerConfig, CircuitState } from "../utils/CircuitBreaker";
 import type { LogLevel } from "../utils/logger";
 import type { ConversionHooks } from "./ConversionTracker";
 import type { RateLimitConfig } from "./RateLimiter";
@@ -57,6 +58,7 @@ export interface FeatureFlags {
   enableConversionTracking: boolean;
   enableSlippageGuard: boolean;
   enableRateLimiting: boolean;
+  enableCircuitBreaker: boolean;
 }
 
 export interface TradingClientConfig {
@@ -74,6 +76,8 @@ export interface TradingClientConfig {
   slippage?: Partial<SlippageConfig>;
   slippageOverrides?: FlowSlippageOverrides;
   rateLimit?: Partial<RateLimitConfig>;
+  circuitBreaker?: Partial<CircuitBreakerConfig>;
+  timeoutMs?: number;
 }
 
 // ── SDK Interface ───────────────────────────────────────────────────────────
@@ -107,3 +111,18 @@ export interface ZeroHashModalParams {
 // When not provided, the client creates an adapter around the real zh-web-sdk.
 
 export type ZeroHashSDKFactory = () => ZeroHashSDKInstance;
+
+// ── Health / Diagnostics ───────────────────────────────────────────────────
+
+export type { CircuitState };
+
+export interface HealthStatus {
+  initialized: boolean;
+  activeFlow: TradingFlowType | null;
+  jwt: { cachedFlows: TradingFlowType[]; inflightFlows: TradingFlowType[] };
+  modal: { isOpen: boolean; currentFlow: TradingFlowType | null };
+  rateLimiter: Record<string, { remaining: number; retryAfterMs: number }> | null;
+  circuitBreaker: { state: CircuitState; failures: number; lastFailure: number | null } | null;
+  conversionFunnels: { flow: TradingFlowType; stepCount: number; lastStep: string; durationMs: number }[];
+  uptime: number;
+}

@@ -9,8 +9,11 @@ import {
   type TradingEventMap,
   type TradingEventType,
 } from "../telemetry/TelemetryHooks";
+import { CircuitBreaker } from "../utils/CircuitBreaker";
+import { generateCorrelationId } from "../utils/correlationId";
 import { createLogger, type Logger } from "../utils/logger";
 import { retry, type RetryOptions } from "../utils/retry";
+import { withTimeout } from "../utils/withTimeout";
 import { ConversionTracker } from "./ConversionTracker";
 import { JWTManager } from "./JWTManager";
 import { ModalManager } from "./ModalManager";
@@ -19,6 +22,7 @@ import { SlippageGuard, type SlippageEvent } from "./SlippageGuard";
 import type {
   FeatureFlags,
   FlowConfig,
+  HealthStatus,
   RetryConfig,
   TradingClientConfig,
   TradingEvent,
@@ -42,7 +46,10 @@ const DEFAULT_FEATURES: FeatureFlags = {
   enableConversionTracking: true,
   enableSlippageGuard: false,
   enableRateLimiting: false,
+  enableCircuitBreaker: false,
 };
+
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 // Maps user-facing events to internal telemetry event types
 const EVENT_MAPPING: Record<TradingEvent, TradingEventType[]> = {
@@ -59,7 +66,10 @@ export class ZeroHashTradingClient {
   private conversionTracker: ConversionTracker | null = null;
   private slippageGuard: SlippageGuard | null = null;
   private rateLimiter: RateLimiter | null = null;
+  private circuitBreaker: CircuitBreaker | null = null;
   private initialized = false;
+  private initTimestamp: number | null = null;
+  private openFlowInProgress: TradingFlowType | null = null;
 
   private readonly eventBus: EventBus<TradingEventMap>;
   private readonly telemetry: TelemetryEmitter;
@@ -69,6 +79,7 @@ export class ZeroHashTradingClient {
   private readonly flowOverrides: Partial<
     Record<TradingFlowType, FlowConfig>
   >;
+  private readonly timeoutMs: number;
 
   constructor(
     private readonly config: TradingClientConfig,
@@ -82,6 +93,7 @@ export class ZeroHashTradingClient {
     this.retryConfig = { ...DEFAULT_RETRY, ...config.retry };
     this.features = { ...DEFAULT_FEATURES, ...config.featureFlags };
     this.flowOverrides = config.flowOverrides ?? {};
+    this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
     this.eventBus = new EventBus<TradingEventMap>();
 
@@ -126,10 +138,22 @@ export class ZeroHashTradingClient {
       });
 
       this.sdk = sdk;
+
+      // Circuit breaker (created before JWTManager since it's injected)
+      if (this.features.enableCircuitBreaker) {
+        this.circuitBreaker = new CircuitBreaker(
+          this.config.circuitBreaker,
+          this.telemetry,
+          this.logger
+        );
+      }
+
       this.jwtManager = new JWTManager(
         this.config.jwtProvider,
         this.telemetry,
-        this.logger
+        this.logger,
+        this.flowOverrides,
+        this.circuitBreaker ?? undefined,
       );
       this.modalManager = new ModalManager(sdk, this.telemetry, this.logger);
 
@@ -161,6 +185,7 @@ export class ZeroHashTradingClient {
       }
 
       this.initialized = true;
+      this.initTimestamp = Date.now();
 
       this.telemetry.track("SDK_INITIALIZED");
       this.logger.info("Client initialized", {
@@ -186,53 +211,78 @@ export class ZeroHashTradingClient {
   async openFlow(flow: TradingFlowType): Promise<void> {
     this.ensureInitialized();
 
-    const execute = async (): Promise<void> => {
+    if (this.openFlowInProgress) {
+      throw new ZeroHashError(
+        ErrorCode.MODAL_CONFLICT,
+        `Cannot open flow "${flow}": flow "${this.openFlowInProgress}" is currently being opened`,
+        { requestedFlow: flow, inProgressFlow: this.openFlowInProgress }
+      );
+    }
+
+    this.openFlowInProgress = flow;
+    const correlationId = generateCorrelationId();
+
+    const execute = async (signal: AbortSignal): Promise<void> => {
       const metadata = this.resolveMetadata(flow);
 
       // Begin conversion funnel
-      this.conversionTracker?.beginFunnel(flow, metadata);
+      this.conversionTracker?.beginFunnel(flow, { ...metadata, correlationId });
 
+      if (signal.aborted) throw signal.reason;
       const jwt = await this.jwtManager!.getToken(flow);
-      this.conversionTracker?.recordStep(flow, "JWT_ACQUIRED");
+      this.conversionTracker?.recordStep(flow, "JWT_ACQUIRED", { correlationId });
 
+      if (signal.aborted) throw signal.reason;
       await this.modalManager!.open(flow, jwt, metadata);
-      this.conversionTracker?.recordStep(flow, "MODAL_DISPLAYED");
+      this.conversionTracker?.recordStep(flow, "MODAL_DISPLAYED", { correlationId });
     };
 
-    const guarded = this.rateLimiter
-      ? () => this.rateLimiter!.acquireForFlow(flow, execute)
-      : execute;
+    const timedExecute = () => withTimeout(
+      (signal) => execute(signal),
+      this.timeoutMs
+    );
 
-    if (this.features.enableRetry && this.retryConfig.enabled) {
-      await this.withRetry(guarded, flow);
-    } else {
-      try {
-        await guarded();
-      } catch (error: unknown) {
-        const zhError = ZeroHashError.fromUnknown(
-          error,
-          ErrorCode.NETWORK_ERROR
-        );
-        this.emitError(zhError, flow);
-        throw zhError;
+    const guarded = this.rateLimiter
+      ? () => this.rateLimiter!.acquireForFlow(flow, timedExecute)
+      : timedExecute;
+
+    try {
+      if (this.features.enableRetry && this.retryConfig.enabled) {
+        await this.withRetry(guarded, flow, correlationId);
+      } else {
+        try {
+          await guarded();
+        } catch (error: unknown) {
+          const zhError = ZeroHashError.fromUnknown(
+            error,
+            ErrorCode.NETWORK_ERROR
+          );
+          this.emitError(zhError, flow, correlationId);
+          throw zhError;
+        }
       }
+    } finally {
+      this.openFlowInProgress = null;
     }
   }
 
-  closeFlow(flow: TradingFlowType): void {
+  async closeFlow(flow: TradingFlowType): Promise<void> {
     this.ensureInitialized();
 
-    this.modalManager!.close(flow)
-      .then(() => {
-        this.conversionTracker?.abandonFunnel(flow);
-      })
-      .catch((error: unknown) => {
-        const zhError = ZeroHashError.fromUnknown(
-          error,
-          ErrorCode.MODAL_CLOSE_FAILED
-        );
-        this.emitError(zhError, flow);
-      });
+    try {
+      await withTimeout(
+        () => this.modalManager!.close(flow),
+        this.timeoutMs
+      );
+      this.conversionTracker?.abandonFunnel(flow);
+    } catch (error: unknown) {
+      const zhError = ZeroHashError.fromUnknown(
+        error,
+        ErrorCode.MODAL_CLOSE_FAILED
+      );
+      this.emitError(zhError, flow);
+      throw zhError;
+    }
   }
 
   /**
@@ -316,6 +366,33 @@ export class ZeroHashTradingClient {
     return this.modalManager?.currentFlow ?? null;
   }
 
+  // ── Health / Diagnostics ──────────────────────────────────────────────
+
+  health(): HealthStatus {
+    const rateLimiterStatus: HealthStatus["rateLimiter"] = this.rateLimiter
+      ? Object.fromEntries(
+          this.rateLimiter.getKeys().map((key) => [key, {
+            remaining: this.rateLimiter!.remaining(key),
+            retryAfterMs: this.rateLimiter!.retryAfterMs(key),
+          }])
+        )
+      : null;
+
+    return {
+      initialized: this.initialized,
+      activeFlow: this.modalManager?.currentFlow ?? null,
+      jwt: this.jwtManager?.getCacheStatus() ?? { cachedFlows: [], inflightFlows: [] },
+      modal: {
+        isOpen: this.modalManager?.isOpen ?? false,
+        currentFlow: this.modalManager?.currentFlow ?? null,
+      },
+      rateLimiter: rateLimiterStatus,
+      circuitBreaker: this.circuitBreaker?.getState() ?? null,
+      conversionFunnels: this.conversionTracker?.getActiveFunnels() ?? [],
+      uptime: this.initTimestamp ? Date.now() - this.initTimestamp : 0,
+    };
+  }
+
   // ── Cleanup ───────────────────────────────────────────────────────────
 
   destroy(): void {
@@ -323,6 +400,7 @@ export class ZeroHashTradingClient {
     this.modalManager?.forceReset();
     this.conversionTracker?.reset();
     this.rateLimiter?.reset();
+    this.circuitBreaker?.reset();
     this.eventBus.removeAllListeners();
     this.sdk = null;
     this.jwtManager = null;
@@ -330,6 +408,8 @@ export class ZeroHashTradingClient {
     this.conversionTracker = null;
     this.slippageGuard = null;
     this.rateLimiter = null;
+    this.circuitBreaker = null;
+    this.initTimestamp = null;
     this.initialized = false;
     this.logger.info("Client destroyed");
   }
@@ -347,7 +427,8 @@ export class ZeroHashTradingClient {
 
   private async withRetry(
     fn: () => Promise<void>,
-    flow: TradingFlowType
+    flow: TradingFlowType,
+    correlationId?: string
   ): Promise<void> {
     const options: Partial<RetryOptions> = {
       retries: this.retryConfig.maxRetries,
@@ -357,7 +438,7 @@ export class ZeroHashTradingClient {
         this.telemetry.track("RETRY_ATTEMPT", flow, {
           attempt,
           errorCode: error.code,
-        });
+        }, correlationId);
       },
     };
 
@@ -368,7 +449,7 @@ export class ZeroHashTradingClient {
         error,
         ErrorCode.RETRY_EXHAUSTED
       );
-      this.emitError(zhError, flow);
+      this.emitError(zhError, flow, correlationId);
       throw zhError;
     }
   }
@@ -383,11 +464,12 @@ export class ZeroHashTradingClient {
     return { ...base, ...override };
   }
 
-  private emitError(error: ZeroHashError, flow?: TradingFlowType): void {
+  private emitError(error: ZeroHashError, flow?: TradingFlowType, correlationId?: string): void {
     this.telemetry.track(
       "ERROR_THROWN",
       flow,
-      errorMetadata(error.code, error.message)
+      errorMetadata(error.code, error.message),
+      correlationId
     );
   }
 

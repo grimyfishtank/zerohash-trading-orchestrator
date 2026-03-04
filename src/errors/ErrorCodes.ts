@@ -11,6 +11,8 @@ export const ErrorCode = {
   RETRY_EXHAUSTED: "RETRY_EXHAUSTED",
   RATE_LIMITED: "RATE_LIMITED",
   SLIPPAGE_EXCEEDED: "SLIPPAGE_EXCEEDED",
+  CIRCUIT_OPEN: "CIRCUIT_OPEN",
+  OPERATION_TIMEOUT: "OPERATION_TIMEOUT",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
@@ -19,4 +21,5 @@ export const RETRYABLE_ERRORS: ReadonlySet<ErrorCode> = new Set([
   ErrorCode.JWT_FETCH_FAILED,
   ErrorCode.NETWORK_ERROR,
   ErrorCode.MODAL_CONFLICT,
+  ErrorCode.OPERATION_TIMEOUT,
 ]);

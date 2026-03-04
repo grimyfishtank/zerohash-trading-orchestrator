@@ -22,6 +22,8 @@ export type {
   ZeroHashSDKFactory,
   ZeroHashSDKInitConfig,
   ZeroHashModalParams,
+  HealthStatus,
+  CircuitState,
 } from "./client/types";
 
 export type {
@@ -40,6 +42,7 @@ export type { RateLimitConfig } from "./client/RateLimiter";
 
 // ── Telemetry ────────────────────────────────────────────────────────────────
 export { EventBus } from "./telemetry/EventBus";
+export type { EventBusErrorHandler } from "./telemetry/EventBus";
 export type {
   TelemetryConfig,
   TelemetryEmitter,
@@ -58,3 +61,7 @@ export { retry } from "./utils/retry";
 export type { RetryOptions, BackoffStrategy } from "./utils/retry";
 export { createLogger } from "./utils/logger";
 export type { Logger, LogLevel } from "./utils/logger";
+export { generateCorrelationId } from "./utils/correlationId";
+export { withTimeout } from "./utils/withTimeout";
+export { CircuitBreaker } from "./utils/CircuitBreaker";
+export type { CircuitBreakerConfig } from "./utils/CircuitBreaker";
